@@ -158,7 +158,7 @@ DROP POLICY IF EXISTS "Lecture de son propre profil et admin" ON public.users;
 
 CREATE POLICY "Lecture de son propre profil et admin" ON public.users 
 FOR SELECT TO authenticated 
-USING (auth.uid() = id OR EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role IN ('admin', 'superadmin')));
+USING (auth.uid() = id OR public.is_admin_or_superadmin(auth.uid()));
 
 DROP POLICY IF EXISTS "Modification par soi-même" ON public.users;
 DROP POLICY IF EXISTS "Modification par l'admin" ON public.users;
@@ -166,14 +166,14 @@ DROP POLICY IF EXISTS "Modification par soi-même ou admin" ON public.users;
 
 CREATE POLICY "Modification par soi-même ou admin" ON public.users 
 FOR UPDATE TO authenticated 
-USING (auth.uid() = id OR EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role IN ('admin', 'superadmin')));
+USING (auth.uid() = id OR public.is_admin_or_superadmin(auth.uid()));
 
 DROP POLICY IF EXISTS "Suppression par l'admin" ON public.users;
 DROP POLICY IF EXISTS "Suppression par admin ou superadmin" ON public.users;
 
 CREATE POLICY "Suppression par admin ou superadmin" ON public.users 
 FOR DELETE TO authenticated 
-USING (EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role IN ('admin', 'superadmin')));
+USING (public.is_admin_or_superadmin(auth.uid()));
 
 -- --- Table: app_settings ---
 DROP POLICY IF EXISTS "Lecture publique pour tous" ON public.app_settings;
@@ -215,12 +215,12 @@ WITH CHECK (auth.uid() = user_id);
 DROP POLICY IF EXISTS "Mise à jour transfert par l'utilisateur ou admin" ON public.transfer_sessions;
 CREATE POLICY "Mise à jour transfert par l'utilisateur ou admin" ON public.transfer_sessions 
 FOR UPDATE TO authenticated 
-USING (auth.uid() = user_id OR EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role IN ('admin', 'superadmin')));
+USING (auth.uid() = user_id OR public.is_admin_or_superadmin(auth.uid()));
 
 DROP POLICY IF EXISTS "Suppression transfert par l'utilisateur ou admin" ON public.transfer_sessions;
 CREATE POLICY "Suppression transfert par l'utilisateur ou admin" ON public.transfer_sessions 
 FOR DELETE TO authenticated 
-USING (auth.uid() = user_id OR EXISTS (SELECT 1 FROM public.users WHERE id = auth.uid() AND role IN ('admin', 'superadmin')));
+USING (auth.uid() = user_id OR public.is_admin_or_superadmin(auth.uid()));
 
 -- --- Table: transactions ---
 DROP POLICY IF EXISTS "Lecture transactions persos et admin" ON public.transactions;
@@ -446,6 +446,30 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
+-- RPC : Supprimer un utilisateur de manière sécurisée (par un admin/superadmin)
+CREATE OR REPLACE FUNCTION public.delete_user_by_admin(target_user_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+  -- 1. Vérifier que l'utilisateur qui exécute la fonction est bien un admin ou superadmin
+  IF NOT public.is_admin_or_superadmin(auth.uid()) THEN
+    RAISE EXCEPTION 'Non autorisé : Seuls les administrateurs peuvent supprimer des comptes.';
+  END IF;
+
+  -- 2. Empêcher la suppression de son propre compte
+  IF target_user_id = auth.uid() THEN
+    RAISE EXCEPTION 'Non autorisé : Vous ne pouvez pas supprimer votre propre compte.';
+  END IF;
+
+  -- 3. Supprimer de auth.users (la table d'authentification Supabase)
+  DELETE FROM auth.users WHERE id = target_user_id;
+
+  -- 4. Supprimer de public.users
+  DELETE FROM public.users WHERE id = target_user_id;
+
+  RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, auth;
+
 -- RPC : Générer un nouveau code d'administration OTP
 CREATE OR REPLACE FUNCTION public.generate_admin_code()
 RETURNS TEXT AS $$
@@ -657,3 +681,103 @@ EXCEPTION
   WHEN OTHERS THEN
     NULL;
 END $$;
+
+-- --- Migration : création des tables banks et iban_cache pour le système IBAN ---
+CREATE TABLE IF NOT EXISTS public.banks (
+  id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  country_code TEXT NOT NULL,
+  bank_code TEXT NOT NULL,
+  bank_name TEXT NOT NULL,
+  bic TEXT,
+  city TEXT,
+  postal_code TEXT,
+  address TEXT,
+  website TEXT,
+  phone TEXT,
+  sepa_supported BOOLEAN DEFAULT true,
+  updated_at TIMESTAMPTZ DEFAULT now(),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  CONSTRAINT banks_country_bank_code_unique UNIQUE (country_code, bank_code)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS banks_country_bank_code_idx ON public.banks (country_code, bank_code);
+
+-- --- Migration : s'assurer de la contrainte UNIQUE sur (country_code, bank_code) pour les upserts ---
+DO $$
+BEGIN
+  -- 1. Éliminer les éventuels doublons pour pouvoir poser la contrainte unique sans erreur
+  DELETE FROM public.banks a USING public.banks b 
+  WHERE a.id > b.id 
+    AND a.country_code = b.country_code 
+    AND a.bank_code = b.bank_code;
+
+  -- 2. S'assurer que l'index existant est UNIQUE
+  DROP INDEX IF EXISTS public.banks_country_bank_code_idx;
+  CREATE UNIQUE INDEX IF NOT EXISTS banks_country_bank_code_idx ON public.banks (country_code, bank_code);
+
+  -- 3. Ajouter la contrainte unique si elle n'existe pas déjà
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint 
+    WHERE conname = 'banks_country_bank_code_unique'
+  ) THEN
+    ALTER TABLE public.banks ADD CONSTRAINT banks_country_bank_code_unique UNIQUE (country_code, bank_code);
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.iban_cache (
+  id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  iban TEXT NOT NULL,
+  country TEXT NOT NULL,
+  bank_code TEXT,
+  bank_name TEXT,
+  bic TEXT,
+  city TEXT,
+  sepa BOOLEAN DEFAULT true,
+  cached_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS iban_cache_iban_idx ON public.iban_cache (iban);
+
+-- Row Level Security (RLS)
+ALTER TABLE public.banks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.iban_cache ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Lecture pour tous les authentifies" ON public.banks;
+CREATE POLICY "Lecture pour tous les authentifies" ON public.banks 
+  FOR SELECT TO authenticated USING (true);
+
+DROP POLICY IF EXISTS "Modifications reservees au superadmin" ON public.banks;
+CREATE POLICY "Modifications reservees au superadmin" ON public.banks 
+  FOR ALL TO authenticated USING (public.is_superadmin(auth.uid())) WITH CHECK (public.is_superadmin(auth.uid()));
+
+DROP POLICY IF EXISTS "Lecture cache pour tous les authentifies" ON public.iban_cache;
+CREATE POLICY "Lecture cache pour tous les authentifies" ON public.iban_cache 
+  FOR SELECT TO authenticated USING (true);
+
+DROP POLICY IF EXISTS "Insertion cache pour tous les authentifies" ON public.iban_cache;
+CREATE POLICY "Insertion cache pour tous les authentifies" ON public.iban_cache 
+  FOR INSERT TO authenticated WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Mise a jour cache pour tous les authentifies" ON public.iban_cache;
+CREATE POLICY "Mise a jour cache pour tous les authentifies" ON public.iban_cache 
+  FOR UPDATE TO authenticated USING (true);
+
+DROP POLICY IF EXISTS "Suppression cache pour superadmin" ON public.iban_cache;
+CREATE POLICY "Suppression cache pour superadmin" ON public.iban_cache 
+  FOR DELETE TO authenticated USING (public.is_superadmin(auth.uid()));
+
+-- --- Migration : ajout de la colonne blocking_thresholds et theme à app_settings et users ---
+DO $$
+BEGIN
+  ALTER TABLE public.app_settings ADD COLUMN IF NOT EXISTS blocking_thresholds TEXT DEFAULT '89,99';
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS blocking_thresholds TEXT DEFAULT NULL;
+  ALTER TABLE public.users ADD COLUMN IF NOT EXISTS theme TEXT DEFAULT 'light';
+EXCEPTION
+  WHEN OTHERS THEN
+    NULL;
+END $$;
+
+
